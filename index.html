@@ -43,9 +43,17 @@
   }
   #sensrow.adjusting #fill{background:#ff5a45;}
 
-  #modes{display:flex;gap:1.2em;margin-top:.2em;}
+  #modes{display:flex;flex-wrap:wrap;gap:1.2em;margin-top:.2em;}
   .mode{color:#4a515b;}
   .mode.on{color:#eceef2;font-weight:600;}
+  .bind{color:#4a515b;}
+
+  #stats{
+    position:absolute;right:1.3em;bottom:1.3em;pointer-events:none;text-align:right;
+    font:var(--ui)/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.06em;color:#6f7681;font-variant-numeric:tabular-nums;
+  }
+  #stats b{color:#eceef2;font-weight:600;}
 
   #fail{
     position:absolute;left:1.3em;top:1.3em;max-width:40ch;
@@ -69,7 +77,14 @@
       <span class="mode on" data-m="static">J static</span>
       <span class="mode" data-m="moving">K moving</span>
       <span class="mode" data-m="flying">L flying</span>
+      <span class="bind">R restart</span>
+      <span class="bind">SPACE double-jump / glide</span>
     </div>
+  </div>
+  <div id="stats">
+    <div><b id="hits">0</b> hits</div>
+    <div><b id="misses">0</b> misses</div>
+    <div><b id="acc">—</b> accuracy</div>
   </div>
   <p id="fail" hidden>Couldn't load the 3D library. Reload the page to try again.</p>
 </div>
@@ -81,6 +96,9 @@ const sensEl = document.getElementById('sens');
 const fillEl = document.getElementById('fill');
 const sensRow = document.getElementById('sensrow');
 const modeEls = document.querySelectorAll('.mode');
+const hitsEl = document.getElementById('hits');
+const missEl = document.getElementById('misses');
+const accEl  = document.getElementById('acc');
 
 let THREE;
 try {
@@ -282,15 +300,32 @@ function moveTargets(t) {
   }
 }
 
-function setTargetMode(m) {
-  targetMode = m;
-  for (const el of modeEls) el.classList.toggle('on', el.dataset.m === m);
-  /* Switching drill resets the board, so every mode starts from a clean
-     set rather than whatever survived the last one. */
+/* ---------- score ---------- */
+let hitCount = 0, missCount = 0;
+
+function drawScore() {
+  hitsEl.textContent = hitCount;
+  missEl.textContent = missCount;
+  const shots = hitCount + missCount;
+  accEl.textContent = shots ? (hitCount / shots * 100).toFixed(1) + '%' : '—';
+}
+
+function resetRange() {
   for (const b of targets) {
     b.userData.hit = false;
     b.material.color.set(0xffffff);
   }
+  hitCount = 0;
+  missCount = 0;
+  drawScore();
+}
+
+function setTargetMode(m) {
+  targetMode = m;
+  for (const el of modeEls) el.classList.toggle('on', el.dataset.m === m);
+  /* Switching drill starts a clean board and a clean scoreline, so the
+     accuracy figure always describes the drill you are actually doing. */
+  resetRange();
 }
 
 /* Where the trail leaves from, in camera space. */
@@ -592,9 +627,7 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyJ') setTargetMode('static');
   if (e.code === 'KeyK') setTargetMode('moving');
   if (e.code === 'KeyL') setTargetMode('flying');
-  if (e.code === 'KeyR') {
-    targets.forEach((b) => { b.userData.hit = false; b.material.color.set(0xffffff); });
-  }
+  if (e.code === 'KeyR') resetRange();
   keys[e.code] = true;
 });
 
@@ -661,11 +694,13 @@ wrap.addEventListener('mousedown', (e) => {
       ball.userData.hit = true;
       ball.material.color.set(0xff4a35);
     }
-  } else if (floor.length) {
-    shotEnd.copy(floor[0].point);
+    hitCount++;
   } else {
-    shotEnd.copy(camera.position).addScaledVector(ray.ray.direction, TRACER_RANGE);
+    missCount++;
+    if (floor.length) shotEnd.copy(floor[0].point);
+    else shotEnd.copy(camera.position).addScaledVector(ray.ray.direction, TRACER_RANGE);
   }
+  drawScore();
 
   /* Into camera space, where the muzzle is a fixed point. */
   camera.worldToLocal(shotEnd);
