@@ -3,9 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Aim Trainer</title>
+<title>aim trainer</title>
 <style>
-  html,body{height:100%;}
+  /* `cursor` is an inherited property, so an explicit value here beats
+     anything a parent document or user stylesheet might hand down. Without
+     it the only guarantee is that WE set nothing — not that nothing is set. */
+  html,body{height:100%;cursor:default;}
   body{margin:0;background:#0d0f12;color:#eceef2;overflow:hidden;}
   #wrap{position:relative;width:100%;height:100%;overflow:hidden;background:#0d0f12;}
   canvas{display:block;width:100%;height:100%;}
