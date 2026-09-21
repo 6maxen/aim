@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>FPS v1</title>
+<title>aim trainer</title>
 <style>
   html,body{height:100%;}
   body{margin:0;background:#0d0f12;color:#eceef2;overflow:hidden;}
@@ -46,7 +46,13 @@
   #modes{display:flex;flex-wrap:wrap;gap:1.2em;margin-top:.2em;}
   .mode{color:#4a515b;}
   .mode.on{color:#eceef2;font-weight:600;}
-  .bind{color:#4a515b;}
+  /* Restarting gives no other feedback once the board is already clean, so
+     the binding itself swells to white to confirm the press landed.
+     Deliberately NOT behind prefers-reduced-motion: that setting was what
+     killed the easing and left a hard on/off blink. A colour fade moves
+     nothing on screen, so it is safe to leave running. */
+  .bind{color:#4a515b;transition:color .45s ease-in-out;}
+  .bind.flash{color:#ffffff;transition:color .22s ease-in-out;}
 
   #stats{
     position:absolute;right:1.3em;bottom:1.3em;pointer-events:none;text-align:right;
@@ -54,6 +60,33 @@
     letter-spacing:.06em;color:#6f7681;font-variant-numeric:tabular-nums;
   }
   #stats b{color:#eceef2;font-weight:600;}
+  #timerow{font-size:1.9em;line-height:1.25;margin-top:.15em;letter-spacing:.02em;}
+
+  #high{
+    position:absolute;right:1.3em;top:1.3em;pointer-events:none;text-align:right;
+    font:calc(var(--ui) * 1.15)/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.06em;color:#e8b53a;font-variant-numeric:tabular-nums;
+  }
+  #high b{color:#ffc83c;font-weight:600;}
+  #himode{color:#9a7a2a;font-size:.85em;margin-top:.1em;}
+
+  #spacehint{
+    position:absolute;left:50%;bottom:1.3em;transform:translateX(-50%);
+    pointer-events:none;white-space:nowrap;
+    font:var(--ui)/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.06em;color:#4a515b;
+  }
+
+  /* Fades up into view and back out; nothing else on screen moves, so the
+     rise is small enough to read as emphasis rather than motion. */
+  #newhi{
+    position:absolute;left:50%;top:3.2em;pointer-events:none;
+    font:calc(var(--ui) * 2.1)/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.22em;color:#ffc83c;
+    opacity:0;transform:translate(-50%, .5em);
+    transition:opacity .45s ease-in-out, transform .45s ease-in-out;
+  }
+  #newhi.show{opacity:1;transform:translate(-50%, 0);}
 
   #fail{
     position:absolute;left:1.3em;top:1.3em;max-width:40ch;
@@ -77,14 +110,20 @@
       <span class="mode on" data-m="static">J static</span>
       <span class="mode" data-m="moving">K moving</span>
       <span class="mode" data-m="flying">L flying</span>
-      <span class="bind">R restart</span>
-      <span class="bind">SPACE double-jump / glide</span>
+      <span class="bind" id="bindR">R restart</span>
     </div>
+  </div>
+  <div id="spacehint">SPACE double-jump / glide</div>
+  <div id="newhi">new highscore</div>
+  <div id="high">
+    <div>highscore: <b id="hi">—</b> seconds</div>
+    <div id="himode">(static)</div>
   </div>
   <div id="stats">
     <div><b id="hits">0</b> hits</div>
     <div><b id="misses">0</b> misses</div>
     <div><b id="acc">—</b> accuracy</div>
+    <div id="timerow"><b id="time">0.000</b> seconds</div>
   </div>
   <p id="fail" hidden>Couldn't load the 3D library. Reload the page to try again.</p>
 </div>
@@ -99,6 +138,12 @@ const modeEls = document.querySelectorAll('.mode');
 const hitsEl = document.getElementById('hits');
 const missEl = document.getElementById('misses');
 const accEl  = document.getElementById('acc');
+const bindREl = document.getElementById('bindR');
+const timeEl = document.getElementById('time');
+const hiEl   = document.getElementById('hi');
+const hiModeEl = document.getElementById('himode');
+const newHiEl = document.getElementById('newhi');
+let newHiTimer = 0;
 
 let THREE;
 try {
@@ -303,6 +348,47 @@ function moveTargets(t) {
 /* ---------- score ---------- */
 let hitCount = 0, missCount = 0;
 
+/* The clock starts on the first target downed, not the first shot, and
+   stops when the last one falls — so it times the run, not your reaction
+   to the page loading. */
+let runStart = null, runEnd = null;
+
+/* Best clear per mode, kept across sessions. Separate records because
+   flying targets are a different drill from static ones — one shared
+   number would just be whichever mode is easiest, forever. */
+const best = { static: null, moving: null, flying: null };
+try {
+  const saved = JSON.parse(localStorage.getItem('boxfield.best2') || '{}');
+  for (const k of ['static', 'moving', 'flying']) {
+    if (Number.isFinite(saved[k]) && saved[k] > 0) best[k] = saved[k];
+  }
+} catch (e) { /* storage blocked or unparseable */ }
+
+function drawBest() {
+  const b = best[targetMode];
+  hiEl.textContent = b === null ? '—' : fmtTime(b);
+  hiModeEl.textContent = '(' + targetMode + ')';
+}
+
+function recordRun(ms) {
+  const b = best[targetMode];
+  if (b !== null && ms >= b) return;
+  best[targetMode] = ms;
+  drawBest();
+  try { localStorage.setItem('boxfield.best2', JSON.stringify(best)); } catch (e) {}
+
+  newHiEl.classList.add('show');
+  clearTimeout(newHiTimer);
+  newHiTimer = setTimeout(() => newHiEl.classList.remove('show'), 1900);
+}
+
+function fmtTime(ms) {
+  const sec = ms / 1000;
+  if (sec < 60) return sec.toFixed(3);
+  const m = Math.floor(sec / 60);
+  return m + ':' + (sec - m * 60).toFixed(3).padStart(6, '0');
+}
+
 function drawScore() {
   hitsEl.textContent = hitCount;
   missEl.textContent = missCount;
@@ -310,19 +396,57 @@ function drawScore() {
   accEl.textContent = shots ? (hitCount / shots * 100).toFixed(1) + '%' : '—';
 }
 
+function drawTime() {
+  if (runStart === null) { timeEl.textContent = '0.000'; return; }
+  timeEl.textContent = fmtTime((runEnd ?? performance.now()) - runStart);
+}
+
+/* Fresh layout on every reset, so a run is never the same board twice and
+   you cannot memorise where to flick. Positions are rejection-sampled:
+   kept clear of the player's spawn and of each other. */
+function scatterTargets() {
+  const placed = [];
+  for (const b of targets) {
+    const d = b.userData;
+    let x = 0, z = 0;
+    for (let i = 0; i < 60; i++) {
+      x = (Math.random() * 2 - 1) * 30;
+      z = -4 - Math.random() * 34;
+      if (Math.hypot(x, z - 12) < 10) continue;                       // not in your face
+      if (placed.every((p) => Math.hypot(p[0] - x, p[1] - z) > 5)) break;   // not stacked
+    }
+    placed.push([x, z]);
+
+    const heading = Math.random() * Math.PI * 2;
+    d.ox = x; d.oz = z;
+    d.dx = Math.cos(heading); d.dz = Math.sin(heading);
+    d.range = 3 + Math.random() * 5;
+    d.speed = 0.45 + Math.random() * 1.2;
+    d.phase = Math.random() * Math.PI * 2;
+    d.holder.position.set(x, 0, z);
+  }
+}
+
 function resetRange() {
+  scatterTargets();
   for (const b of targets) {
     b.userData.hit = false;
     b.material.color.set(0xffffff);
   }
   hitCount = 0;
   missCount = 0;
+  runStart = null;
+  runEnd = null;
   drawScore();
+  drawTime();
 }
+
+drawBest();   // paint whatever was restored from storage
 
 function setTargetMode(m) {
   targetMode = m;
   for (const el of modeEls) el.classList.toggle('on', el.dataset.m === m);
+  drawBest();   // each mode carries its own record
   /* Switching drill starts a clean board and a clean scoreline, so the
      accuracy figure always describes the drill you are actually doing. */
   resetRange();
@@ -516,12 +640,10 @@ function move(dt) {
       airCap = Math.max(T.maxSpeed, Math.hypot(vx, vz));
     }
   } else {
-    /* Mid-air jump. Velocity is SET, not added, so a second jump on the way
-       down cancels the fall instead of doing almost nothing.
-       It fires on a fresh press, or automatically once you start falling
-       with Space still held — otherwise holding for the glide would eat
-       the double jump, since the key never goes up to re-trigger. */
-    if (jumpsLeft > 0 && (jumpEdge || (keys.Space && vy < 0))) {
+    /* Mid-air jump, on a fresh press only. Velocity is SET, not added, so
+       a second jump on the way down cancels the fall instead of doing
+       almost nothing. Holding Space never triggers it — a hold is a glide. */
+    if (jumpEdge && jumpsLeft > 0) {
       vy = T.airJumpVel;
       jumpsLeft--;
       airLift = true;
@@ -627,15 +749,19 @@ addEventListener('keydown', (e) => {
   if (e.code === 'KeyJ') setTargetMode('static');
   if (e.code === 'KeyK') setTargetMode('moving');
   if (e.code === 'KeyL') setTargetMode('flying');
-  if (e.code === 'KeyR') resetRange();
+  if (e.code === 'KeyR') {
+    resetRange();
+    bindREl.classList.add('flash');   // stays lit until the key comes up
+  }
   keys[e.code] = true;
 });
 
 addEventListener('keyup', (e) => {
+  if (e.code === 'KeyR') bindREl.classList.remove('flash');
   if (e.code === 'ControlLeft' || e.code === 'KeyC') crouching = false;
   keys[e.code] = false;
 });
-addEventListener('blur', () => { for (const k in keys) keys[k] = false; crouching = false; });
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; crouching = false; bindREl.classList.remove('flash'); });
 
 /* ---------- accuracy ----------
    Accuracy returns below a speed threshold rather than at a dead stop.
@@ -693,6 +819,12 @@ wrap.addEventListener('mousedown', (e) => {
     if (!ball.userData.hit) {
       ball.userData.hit = true;
       ball.material.color.set(0xff4a35);
+      if (runStart === null) runStart = performance.now();
+      if (targets.every((t) => t.userData.hit)) {
+        runEnd = performance.now();
+        drawTime();
+        recordRun(runEnd - runStart);
+      }
     }
     hitCount++;
   } else {
@@ -770,6 +902,8 @@ renderer.setAnimationLoop(() => {
 
   camera.position.set(pos.x, pos.y + eyeHeight, pos.z);
   camera.rotation.set(pitch, yaw, 0);
+
+  if (runStart !== null && runEnd === null) drawTime();
 
   renderer.render(scene, camera);
 });
