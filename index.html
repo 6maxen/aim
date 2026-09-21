@@ -3,43 +3,40 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>aim trainer</title>
+<title>FPS v1</title>
 <style>
   html,body{height:100%;}
   body{margin:0;background:#0d0f12;color:#eceef2;overflow:hidden;}
   #wrap{position:relative;width:100%;height:100%;overflow:hidden;background:#0d0f12;cursor:crosshair;}
   canvas{display:block;width:100%;height:100%;}
 
-  /* Everything below sizes off these two, so the whole overlay scales
-     together — change --ui to resize the HUD, --cross for the reticle. */
-  :root{ --ui: 0.75rem; --cross: 1.15rem; --cross-w: 1px; --cross-gap: 0px; }
+  /* --ui scales the whole HUD; --cross-arm is the reticle's arm length in
+     whole pixels (see the note below for why it is not an em). */
+  :root{ --ui: 0.75rem; --cross-arm: 9px; }
 
-  /* Four arms measured outward from a zero-size anchor, rather than two
-     full-length bars centred with translate(-50%,-50%). Centring a box of
-     1.15rem means offsetting by half of 18.4px = 9.2px, and the browser
-     rounds each side of that independently — so one arm ends up a pixel
-     longer than its opposite. Here opposite arms share one length value
-     and cannot disagree. */
+  /* Pixel-snapped reticle. Two rules make it symmetric:
+
+     1. Each bar's LEADING EDGE sits on the anchor rather than being centred
+        on it, so there is no -0.5px offset anywhere. A bar is 2*arm+1 long,
+        which leaves exactly `arm` pixels either side of the one centre
+        pixel — the two halves are the same integer by construction.
+     2. resize() snaps the anchor itself to a whole device pixel, so the
+        bars land on the pixel grid instead of straddling it.
+
+     The arm length is a whole number of px, not an em, for the same
+     reason: 1.15rem is 18.4px, and half of that cannot be drawn. */
   #cross{
     position:absolute;left:50%;top:50%;width:0;height:0;pointer-events:none;
   }
-  /* Arm thickness stays at 1px: an em-scaled hairline lands across
-     fractional pixels and renders as a grey smear. */
   #cross span{position:absolute;background:#eceef2;}
-  #cross .up,
-  #cross .dn{
-    width:var(--cross-w);height:calc(var(--cross) / 2);
-    left:calc(var(--cross-w) / -2);
+  #cross .v{
+    left:0;width:1px;
+    top:calc(-1 * var(--cross-arm));height:calc(2 * var(--cross-arm) + 1px);
   }
-  #cross .up{bottom:var(--cross-gap);}
-  #cross .dn{top:var(--cross-gap);}
-  #cross .lf,
-  #cross .rt{
-    height:var(--cross-w);width:calc(var(--cross) / 2);
-    top:calc(var(--cross-w) / -2);
+  #cross .h{
+    top:0;height:1px;
+    left:calc(-1 * var(--cross-arm));width:calc(2 * var(--cross-arm) + 1px);
   }
-  #cross .lf{right:var(--cross-gap);}
-  #cross .rt{left:var(--cross-gap);}
 
   #speedo{
     position:absolute;left:1.3em;bottom:1.3em;pointer-events:none;
@@ -121,10 +118,7 @@
 </head>
 <body>
 <div id="wrap">
-  <div id="cross">
-    <span class="up"></span><span class="dn"></span>
-    <span class="lf"></span><span class="rt"></span>
-  </div>
+  <div id="cross"><span class="v"></span><span class="h"></span></div>
   <div id="speedo">
     <div id="sensrow">
       <span>sens</span>
@@ -156,6 +150,7 @@
 
 <script type="module">
 const wrap   = document.getElementById('wrap');
+const crossEl = document.getElementById('cross');
 const failEl = document.getElementById('fail');
 const sensEl = document.getElementById('sens');
 const sensBaseEl = document.getElementById('sensbase');
@@ -296,7 +291,7 @@ const T = {
   landScale: 0.75,     // landing bleeds speed
   eye:       1.65,
 
-  crouchMul: 0.31,     // ctrl / c
+  crouchMul: 0.31,     // ctrl
   crouchEye: 1.15,
 };
 
@@ -830,7 +825,7 @@ addEventListener('keydown', (e) => {
 
   if (e.repeat) { keys[e.code] = true; return; }
   if (e.code === 'Space') { e.preventDefault(); if (locked) jumpEdge = true; }
-  if (e.code === 'ControlLeft' || e.code === 'KeyC') { e.preventDefault(); crouching = true; }
+  if (e.code === 'ControlLeft' || e.code === 'ControlRight') { e.preventDefault(); crouching = true; }
   if (e.code === 'KeyJ') setTargetMode('static');
   if (e.code === 'KeyK') setTargetMode('moving');
   if (e.code === 'KeyL') setTargetMode('flying');
@@ -843,7 +838,7 @@ addEventListener('keydown', (e) => {
 
 addEventListener('keyup', (e) => {
   if (e.code === 'KeyR') bindREl.classList.remove('flash');
-  if (e.code === 'ControlLeft' || e.code === 'KeyC') crouching = false;
+  if (e.code === 'ControlLeft' || e.code === 'ControlRight') crouching = false;
   keys[e.code] = false;
 });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; crouching = false; bindREl.classList.remove('flash'); });
@@ -941,6 +936,15 @@ wrap.addEventListener('mousedown', (e) => {
 function resize() {
   const w = wrap.clientWidth, h = wrap.clientHeight;
   renderer.setSize(w, h, false);
+
+  /* Put the reticle's anchor on a whole device pixel. left:50% of an odd
+     width lands on a half pixel, which the browser then rounds per edge —
+     that is what makes one arm come out longer than its opposite. */
+  const dpr = window.devicePixelRatio || 1;
+  const snap = (v) => Math.round(v * dpr) / dpr;
+  crossEl.style.left = snap(w / 2) + 'px';
+  crossEl.style.top  = snap(h / 2) + 'px';
+
   camera.aspect = w / Math.max(h, 1);
 
   /* vFov = 2 * atan( tan(hFov / 2) / aspect ). Clamped because a very tall
