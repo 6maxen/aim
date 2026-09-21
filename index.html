@@ -791,7 +791,7 @@ wrap.addEventListener('mousedown', (e) => {
     }
     if (scoring) hitCount++;
   } else {
-    if (scoring) missCount++;
+    if (scoring && runStart !== null) missCount++;
     if (floor.length) shotEnd.copy(floor[0].point);
     else shotEnd.copy(camera.position).addScaledVector(ray.ray.direction, TRACER_RANGE);
   }
