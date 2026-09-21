@@ -12,18 +12,34 @@
 
   /* Everything below sizes off these two, so the whole overlay scales
      together — change --ui to resize the HUD, --cross for the reticle. */
-  :root{ --ui: 0.75rem; --cross: 1.15rem; }
+  :root{ --ui: 0.75rem; --cross: 1.15rem; --cross-w: 1px; --cross-gap: 0px; }
 
+  /* Four arms measured outward from a zero-size anchor, rather than two
+     full-length bars centred with translate(-50%,-50%). Centring a box of
+     1.15rem means offsetting by half of 18.4px = 9.2px, and the browser
+     rounds each side of that independently — so one arm ends up a pixel
+     longer than its opposite. Here opposite arms share one length value
+     and cannot disagree. */
   #cross{
-    position:absolute;left:50%;top:50%;
-    width:var(--cross);height:var(--cross);
-    transform:translate(-50%,-50%);pointer-events:none;
+    position:absolute;left:50%;top:50%;width:0;height:0;pointer-events:none;
   }
-  /* Hairlines stay at 1px: an em-scaled reticle line blurs across
-     fractional pixels and stops reading as a crosshair. */
+  /* Arm thickness stays at 1px: an em-scaled hairline lands across
+     fractional pixels and renders as a grey smear. */
   #cross span{position:absolute;background:#eceef2;}
-  #cross .h{top:50%;left:0;width:100%;height:1px;margin-top:-.5px;}
-  #cross .v{left:50%;top:0;height:100%;width:1px;margin-left:-.5px;}
+  #cross .up,
+  #cross .dn{
+    width:var(--cross-w);height:calc(var(--cross) / 2);
+    left:calc(var(--cross-w) / -2);
+  }
+  #cross .up{bottom:var(--cross-gap);}
+  #cross .dn{top:var(--cross-gap);}
+  #cross .lf,
+  #cross .rt{
+    height:var(--cross-w);width:calc(var(--cross) / 2);
+    top:calc(var(--cross-w) / -2);
+  }
+  #cross .lf{right:var(--cross-gap);}
+  #cross .rt{left:var(--cross-gap);}
 
   #speedo{
     position:absolute;left:1.3em;bottom:1.3em;pointer-events:none;
@@ -34,6 +50,14 @@
   #speedo b{color:#eceef2;font-weight:600;}
   #sensrow{display:flex;align-items:center;gap:.7em;}
   .key{color:#8b939e;font-weight:600;}
+  /* Shift steps are 0.001; the value pulses green so a change that small
+     is still visible at a glance. */
+  #sens{transition:color .45s ease-in-out;}
+  #sens.fine{color:#3ddc84;transition:color .18s ease-in-out;}
+  /* A trailing zero fades out on its own after a few seconds. Opacity, not
+     removal, so the number keeps its width and nothing shifts around it. */
+  #sensmilli{transition:opacity .7s ease-in-out;}
+  #sensmilli.gone{opacity:0;}
   #bar{
     position:relative;width:12em;height:.34em;background:#2a2f36;overflow:hidden;
   }
@@ -97,14 +121,16 @@
 </head>
 <body>
 <div id="wrap">
-  <div id="cross"><span class="h"></span><span class="v"></span></div>
+  <div id="cross">
+    <span class="up"></span><span class="dn"></span>
+    <span class="lf"></span><span class="rt"></span>
+  </div>
   <div id="speedo">
     <div id="sensrow">
       <span>sens</span>
-      <span class="key">−</span>
+      <span class="key">(−/+)</span>
       <div id="bar"><i id="fill"></i></div>
-      <span class="key">+</span>
-      <b id="sens">0.25</b>
+      <b id="sens"><span id="sensbase">0.25</span><span id="sensmilli"></span></b>
     </div>
     <div id="modes">
       <span class="mode on" data-m="static">J static</span>
@@ -132,6 +158,8 @@
 const wrap   = document.getElementById('wrap');
 const failEl = document.getElementById('fail');
 const sensEl = document.getElementById('sens');
+const sensBaseEl = document.getElementById('sensbase');
+const sensMilliEl = document.getElementById('sensmilli');
 const fillEl = document.getElementById('fill');
 const sensRow = document.getElementById('sensrow');
 const modeEls = document.querySelectorAll('.mode');
@@ -157,38 +185,86 @@ try {
    SENSITIVITY
    Valorant turns 0.07 degrees per mouse count per 1.0 sens, so the
    in-game number maps straight onto raw mouse deltas.
-   A tap on - or + moves 0.01, or 0.10 with Shift. Holding sweeps the value
-   continuously instead of stepping, accelerating the longer you hold, so
-   crossing the range is quick while fine adjustment stays precise.
+   A tap on - or + moves 0.01; hold Shift and it moves 0.001. Holding the
+   key sweeps continuously and accelerates, and Shift slows that sweep to
+   a crawl — so Shift always means precision, tapped or held.
    ============================================================ */
 const SENS_MIN = 0.05, SENS_MAX = 6, SENS_STEP = 0.01;
-const SENS_BIG = 0.10;          // step while Shift is held
+const SENS_FINE = 0.001;        // step while Shift is held
 const SENS_DEFAULT = 0.25;
 const SENS_HOLD_DELAY = 0.22;   // seconds before a hold starts sweeping
 const SENS_RATE = 0.20;         // sens units per second at the start of a hold
 const SENS_RAMP = 5;            // how fast that rate grows
 const SENS_RATE_MAX = 3.0;      // ceiling, units per second
-const SENS_SHIFT_MUL = 8;       // Shift makes the sweep much faster
+const SENS_SHIFT_MUL = 0.08;    // Shift slows the sweep for fine work
 
 let valSens = SENS_DEFAULT;
 let sensHold = 0;
 let sensFloat = valSens;   // unsnapped value the hold sweeps through
 
+/* Once you have worked at 0.001 resolution the third decimal stays on for
+   good, so a value does not silently change width from 0.253 to 0.25 and
+   leave you unsure whether the thousandths are still there. */
+let fineUsed = false;
+let milliTimer = 0;
+let milliHidden = false;   // the trailing zero has already faded out
+
 try {
   const saved = parseFloat(localStorage.getItem('boxfield.sens5'));
-  if (Number.isFinite(saved) && saved >= SENS_MIN && saved <= SENS_MAX) valSens = saved;
+  if (Number.isFinite(saved) && saved >= SENS_MIN && saved <= SENS_MAX) {
+    valSens = saved;
+    if (Math.round(saved * 1000) % 10 !== 0) fineUsed = true;   // restored a fine value
+  }
 } catch (e) { /* storage blocked */ }
 
 const radPerCount = () => valSens * 0.07 * Math.PI / 180;
 
-function setSens(next) {
-  /* Snap to the step grid and round away float drift, so 1.05 stays 1.05
-     rather than becoming 1.0500000000000003 after a few presses. */
-  const snapped = Math.round(next / SENS_STEP) * SENS_STEP;
-  valSens = Math.min(SENS_MAX, Math.max(SENS_MIN, Math.round(snapped * 100) / 100));
-  sensEl.textContent = valSens.toFixed(2);
+function setSens(next, grid = SENS_STEP) {
+  /* Snap to whichever grid the caller is working on — coarse moves stay on
+     0.01 so the display stays short, fine ones land on 0.001. Rounding to
+     three places kills the float drift either way. */
+  const snapped = Math.round(next / grid) * grid;
+  valSens = Math.min(SENS_MAX, Math.max(SENS_MIN, Math.round(snapped * 1000) / 1000));
+
+  /* Third decimal appears the first time a fine step is used, or whenever
+     a value happens to land there, and from then on it stays — except a
+     trailing zero, which lingers three seconds and then fades. */
+  if (grid === SENS_FINE) fineUsed = true;
+  const thousandths = Math.round(valSens * 1000) % 10;
+  const showMilli = fineUsed || thousandths !== 0;
+
+  const text = valSens.toFixed(showMilli ? 3 : 2);
+  sensBaseEl.textContent = showMilli ? text.slice(0, -1) : text;
+  sensMilliEl.textContent = showMilli ? text.slice(-1) : '';
+
+  clearTimeout(milliTimer);
+  if (!showMilli) {
+    milliHidden = false;
+  } else if (thousandths !== 0) {
+    /* A real digit is always visible. */
+    milliHidden = false;
+    sensMilliEl.classList.remove('gone');
+  } else if (milliHidden) {
+    /* Already faded once — a coarse step that leaves the thousandths at
+       zero should not flash it back up and start the countdown again. */
+    sensMilliEl.classList.add('gone');
+  } else {
+    sensMilliEl.classList.remove('gone');
+    milliTimer = setTimeout(() => {
+      sensMilliEl.classList.add('gone');
+      milliHidden = true;
+    }, 3000);
+  }
+
   fillEl.style.width = (((valSens - SENS_MIN) / (SENS_MAX - SENS_MIN)) * 100).toFixed(1) + '%';
-  try { localStorage.setItem('boxfield.sens5', valSens.toFixed(2)); } catch (e) {}
+  try { localStorage.setItem('boxfield.sens5', valSens.toFixed(3)); } catch (e) {}
+}
+
+let fineTimer = 0;
+function pulseFine() {
+  sensEl.classList.add('fine');
+  clearTimeout(fineTimer);
+  fineTimer = setTimeout(() => sensEl.classList.remove('fine'), 200);
 }
 
 /* movementX is delivered in CSS pixels. With unadjustedMovement granted
@@ -738,9 +814,13 @@ document.addEventListener('mousemove', (e) => {
 addEventListener('keydown', (e) => {
   /* A tap on - or + steps once; the loop takes over if the key is held. */
   if (!e.repeat) {
-    const step = e.shiftKey ? SENS_BIG : SENS_STEP;
-    if (e.code === 'Minus' || e.code === 'NumpadSubtract') { setSens(valSens - step); sensHold = 0; sensFloat = valSens; }
-    if (e.code === 'Equal' || e.code === 'NumpadAdd')      { setSens(valSens + step); sensHold = 0; sensFloat = valSens; }
+    const fine = e.shiftKey;
+    const step = fine ? SENS_FINE : SENS_STEP;
+    /* Taps always resolve on the 0.001 grid so a coarse step adds exactly
+       0.01 to what is already there — 0.253 goes to 0.263, not 0.26. */
+    const grid = SENS_FINE;
+    if (e.code === 'Minus' || e.code === 'NumpadSubtract') { setSens(valSens - step, grid); sensHold = 0; sensFloat = valSens; if (fine) pulseFine(); }
+    if (e.code === 'Equal' || e.code === 'NumpadAdd')      { setSens(valSens + step, grid); sensHold = 0; sensFloat = valSens; if (fine) pulseFine(); }
   }
 
   if (e.repeat) { keys[e.code] = true; return; }
@@ -879,10 +959,12 @@ renderer.setAnimationLoop(() => {
          per-frame change under half a step would round away and the value
          would sit still, so the sweep has to keep its own unsnapped copy. */
       const t = sensHold - SENS_HOLD_DELAY;
+      const fine = keys.ShiftLeft || keys.ShiftRight;
       let rate = Math.min(SENS_RATE * (1 + SENS_RAMP * t), SENS_RATE_MAX);
-      if (keys.ShiftLeft || keys.ShiftRight) rate *= SENS_SHIFT_MUL;
+      if (fine) rate *= SENS_SHIFT_MUL;
       sensFloat = Math.min(SENS_MAX, Math.max(SENS_MIN, sensFloat + sensDir * rate * frame));
-      setSens(sensFloat);
+      setSens(sensFloat, fine ? SENS_FINE : SENS_STEP);
+      if (fine) pulseFine();
     }
   } else {
     sensHold = 0;
