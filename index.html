@@ -97,6 +97,7 @@
   #spacehint{
     position:absolute;left:50%;bottom:1.3em;transform:translateX(-50%);
     pointer-events:none;white-space:nowrap;
+    display:flex;gap:1.4em;
     font:var(--ui)/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
     letter-spacing:.06em;color:#4a515b;
   }
@@ -136,7 +137,10 @@
       <span class="bind" id="bindR">R restart</span>
     </div>
   </div>
-  <div id="spacehint">SPACE double-jump / glide</div>
+  <div id="spacehint">
+    <span>SPACE double-jump</span>
+    <span>F fullscreen</span>
+  </div>
   <div id="newhi">new highscore</div>
   <div id="high">
     <div>highscore: <b id="hi">—</b> seconds</div>
@@ -843,6 +847,10 @@ addEventListener('keydown', (e) => {
     resetRange();
     bindREl.classList.add('flash');   // stays lit until the key comes up
   }
+  if (e.code === 'KeyF') {
+    e.preventDefault();
+    toggleFullscreen();
+  }
   keys[e.code] = true;
 });
 
@@ -852,6 +860,30 @@ addEventListener('keyup', (e) => {
   keys[e.code] = false;
 });
 addEventListener('blur', () => { for (const k in keys) keys[k] = false; crouching = false; bindREl.classList.remove('flash'); });
+
+/* ---------- fullscreen ----------
+   Fullscreen needs a user gesture, which a keypress counts as. Inside an
+   iframe it also needs the frame to allow it, so the request can simply be
+   refused — hence the catch. Requesting on #wrap rather than the document
+   keeps the HUD, which all lives inside it. */
+function toggleFullscreen() {
+  const fsEl = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fsEl) {
+    (document.exitFullscreen || document.webkitExitFullscreen)?.call(document);
+    return;
+  }
+  const req = wrap.requestFullscreen || wrap.webkitRequestFullscreen;
+  try {
+    const p = req?.call(wrap);
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch (e) { /* refused — stay windowed */ }
+}
+
+/* The viewport changes size on the way in and out, and some browsers do
+   not fire a plain resize for it. */
+for (const ev of ['fullscreenchange', 'webkitfullscreenchange']) {
+  document.addEventListener(ev, () => setTimeout(resize, 0));
+}
 
 /* ---------- accuracy ----------
    Accuracy returns below a speed threshold rather than at a dead stop.
