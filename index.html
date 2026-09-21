@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>FPS v1</title>
+<title>aim trainer</title>
 <style>
   html,body{height:100%;}
   body{margin:0;background:#0d0f12;color:#eceef2;overflow:hidden;}
@@ -305,6 +305,11 @@ const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x0d0f12);
 scene.fog = new THREE.Fog(0x0d0f12, 40, 130);
 
+/* Valorant runs a fixed 103 degree HORIZONTAL field of view and lets the
+   vertical follow the aspect ratio. three.js takes the vertical figure, so
+   resize() converts. The 75 here is a placeholder — resize() overwrites it
+   before the first frame. */
+const H_FOV = 103;
 const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 400);
 camera.rotation.order = 'YXZ';
 /* The camera has children (the gun, the tracers), and three.js only renders
@@ -937,6 +942,14 @@ function resize() {
   const w = wrap.clientWidth, h = wrap.clientHeight;
   renderer.setSize(w, h, false);
   camera.aspect = w / Math.max(h, 1);
+
+  /* vFov = 2 * atan( tan(hFov / 2) / aspect ). Clamped because a very tall
+     window would otherwise push the vertical past 180 and produce a broken
+     projection; in that case the horizontal narrows instead. */
+  const half = Math.tan(H_FOV * Math.PI / 360);
+  const vFov = 2 * Math.atan(half / camera.aspect) * 180 / Math.PI;
+  camera.fov = Math.min(vFov, 120);
+
   camera.updateProjectionMatrix();
 }
 addEventListener('resize', resize);
