@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Boxfield Range</title>
+<style>
+  html,body{height:100%;}
+  body{margin:0;background:#0d0f12;color:#eceef2;overflow:hidden;}
+  #wrap{position:relative;width:100%;height:100%;overflow:hidden;background:#0d0f12;cursor:crosshair;}
+  canvas{display:block;width:100%;height:100%;}
+
+  #cross{
+    position:absolute;left:50%;top:50%;width:18px;height:18px;
+    transform:translate(-50%,-50%);pointer-events:none;
+  }
+  #cross span{position:absolute;background:#eceef2;}
+  #cross .h{top:50%;left:0;width:100%;height:1px;margin-top:-.5px;}
+  #cross .v{left:50%;top:0;height:100%;width:1px;margin-left:-.5px;}
+
+  #speedo{
+    position:absolute;left:16px;bottom:16px;pointer-events:none;
+    font:12px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+    letter-spacing:.06em;color:#6f7681;font-variant-numeric:tabular-nums;
+    display:flex;flex-direction:column;gap:6px;align-items:flex-start;
+  }
+  #speedo b{color:#eceef2;font-weight:600;}
+  #sensrow{display:flex;align-items:center;gap:8px;}
+  .key{color:#8b939e;font-weight:600;}
+  #bar{
+    position:relative;width:140px;height:4px;background:#2a2f36;overflow:hidden;
+  }
+  #fill{
+    position:absolute;left:0;top:0;bottom:0;width:0;background:#eceef2;
+    transition:background .12s linear;
+  }
+  #sensrow.adjusting #fill{background:#ff5a45;}
+
+  #modes{display:flex;gap:14px;margin-top:2px;}
+  .mode{color:#4a515b;}
+  .mode.on{color:#eceef2;font-weight:600;}
+
+  #fail{
+    position:absolute;left:16px;top:16px;max-width:40ch;
+    font:13px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#ff6b5a;
+  }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="cross"><span class="h"></span><span class="v"></span></div>
+  <div id="speedo">
+    <div id="sensrow">
+      <span>sens</span>
+      <span class="key">−</span>
+      <div id="bar"><i id="fill"></i></div>
+      <span class="key">+</span>
+      <b id="sens">1.50</b>
+      <span id="inputmode">—</span>
+    </div>
+    <div id="modes">
+      <span class="mode on" data-m="static">J static</span>
+      <span class="mode" data-m="moving">K moving</span>
+      <span class="mode" data-m="flying">L flying</span>
+    </div>
+  </div>
+  <p id="fail" hidden>Couldn't load the 3D library. Reload the page to try again.</p>
+</div>
+
+<script type="module">
+const wrap   = document.getElementById('wrap');
+const failEl = document.getElementById('fail');
+const sensEl = document.getElementById('sens');
+const fillEl = document.getElementById('fill');
+const sensRow = document.getElementById('sensrow');
+const inputEl = document.getElementById('inputmode');
+const modeEls = document.querySelectorAll('.mode');
+
+let THREE;
+try {
+  THREE = await import('https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js');
+} catch (err) {
+  failEl.hidden = false;
+  throw err;
+}
+
+/* ============================================================
+   SENSITIVITY
+   Valorant turns 0.07 degrees per mouse count per 1.0 sens, so the
+   in-game number maps straight onto raw mouse deltas.
+   - and + move it in 0.05 steps; holding fires those steps faster
+   and faster, so the value always lands on a clean multiple.
+   ============================================================ */
+const SENS_MIN = 0.05, SENS_MAX = 6, SENS_STEP = 0.05;
+const SENS_DEFAULT = 1.50;
+const SENS_HOLD_DELAY = 0.25;   // seconds before a hold starts repeating
+const SENS_RATE = 8;            // steps per second at the start of a hold
+const SENS_RAMP = 3;            // how fast that rate grows
+const SENS_RATE_MAX = 40;
+
+let valSens = SENS_DEFAULT;
+let sensHold = 0, sensAccum = 0;
+
+try {
+  const saved = parseFloat(localStorage.getItem('boxfield.sens3'));
+  if (Number.isFinite(saved) && saved >= SENS_MIN && saved <= SENS_MAX) valSens = saved;
+} catch (e) { /* storage blocked */ }
+
+const radPerCount = () => valSens * 0.07 * Math.PI / 180;
+
+function setSens(next) {
+  /* Snap to the step grid and round away float drift, so 1.05 stays 1.05
+     rather than becoming 1.0500000000000003 after a few presses. */
+  const snapped = Math.round(next / SENS_STEP) * SENS_STEP;
+  valSens = Math.min(SENS_MAX, Math.max(SENS_MIN, Math.round(snapped * 100) / 100));
+  sensEl.textContent = valSens.toFixed(2);
+  fillEl.style.width = (((valSens - SENS_MIN) / (SENS_MAX - SENS_MIN)) * 100).toFixed(1) + '%';
+  try { localStorage.setItem('boxfield.sens3', valSens.toFixed(2)); } catch (e) {}
+}
+
+/* movementX is delivered in CSS pixels. With unadjustedMovement granted
+   that is one raw count per pixel on a standard display; if the whole
+   thing feels exactly 2x fast or slow, this is the dial to turn. */
+const COUNT_SCALE = 1;
+
+setSens(valSens);   // paint the readout with whatever was restored
+
+/* ============================================================
+   MOVEMENT TUNING — Valorant
+   Run/walk/crouch speeds are community measurements, not published
+   figures; accel, friction and landing are tuned by feel.
+   ============================================================ */
+const T = {
+  maxSpeed:  6.75,     // m/s run
+  accel:     14,       // snappy ramp-up
+  friction:  10,       // hard stop, so counter-strafes bite immediately
+  stopSpeed:  3.0,
+  airAccel:   3,       // barely any steering once airborne
+  airCap:     6.75,
+  gravity:   22,
+  jumpVel:    6.6,     // ~0.99 m jump
+  airJumps:   1,       // extra jumps available before touching the ground
+  airJumpVel: 14.0,    // second jump launches far higher than the first
+  airJumpGrav: 1.60,   // extra gravity while that lift is rising, so it snaps up
+  glideGrav:  0.20,    // fraction of gravity while holding Space on the way down
+  glideFall:  1.60,    // m/s terminal fall speed while gliding
+  landScale: 0.75,     // landing bleeds speed
+  eye:       1.65,
+
+  crouchMul: 0.31,     // ctrl / c
+  crouchEye: 1.15,
+};
+
+/* ---------- scene ---------- */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d0f12);
+scene.fog = new THREE.Fog(0x0d0f12, 40, 130);
+
+const camera = new THREE.PerspectiveCamera(75, 1, 0.1, 400);
+camera.rotation.order = 'YXZ';
+/* The camera has children (the gun, the tracers), and three.js only renders
+   those if the camera itself is part of the scene graph. */
+scene.add(camera);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+wrap.appendChild(renderer.domElement);
+
+scene.add(new THREE.HemisphereLight(0xdfe6f0, 0x15181d, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.15);
+sun.position.set(10, 22, 8);
+scene.add(sun);
+
+const ground = new THREE.Mesh(
+  new THREE.PlaneGeometry(200, 200),
+  new THREE.MeshLambertMaterial({ color: 0x1b1e23 })
+);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+const grid = new THREE.GridHelper(200, 100, 0x3a414a, 0x272c33);
+grid.position.y = 0.01;
+scene.add(grid);
+
+/* ---------- targets ----------
+   Head-sized spheres at head height, each on a thin post so they read as
+   standing on the floor instead of hovering. Heading is the direction the
+   target slides along, in degrees. */
+const BALL_R = 0.28, BALL_Y = 1.70, POST_R = 0.018;
+
+const ballGeo = new THREE.SphereGeometry(BALL_R, 24, 16);
+const postGeo = new THREE.CylinderGeometry(POST_R, POST_R, 1, 6);
+postGeo.translate(0, 0.5, 0);                       // base at the origin
+
+const SPAWN = [
+  //  x,    z,  heading, range, speed
+  [  -8, -14,    0, 5.0, 0.85],
+  [   6, -18,   90, 4.0, 1.20],
+  [  14,  -8,   35, 6.0, 0.60],
+  [ -16,  -6,  110, 3.5, 1.45],
+  [   0, -25,    0, 8.0, 0.45],
+  [ -22, -18,   60, 5.5, 0.95],
+  [  20, -22,  145, 4.5, 1.10],
+  [  10,   3,   90, 3.0, 1.60],
+  [ -11,   5,    0, 4.0, 1.30],
+  [  24,   2,   20, 6.5, 0.70],
+  [ -26, -30,   75, 7.0, 0.55],
+  [   4, -34,  160, 5.0, 1.00],
+];
+
+const targets = SPAWN.map(([x, z, heading, range, speed], i) => {
+  /* Ball and post ride in one group, so the post follows the patrol. Only
+     the ball goes in the targets list, so the post is not shootable. */
+  const holder = new THREE.Group();
+  holder.position.set(x, 0, z);
+
+  /* Ball and post share one material, so the post is always exactly the
+     ball's colour — including when it turns red on a hit. */
+  const mat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+
+  const ball = new THREE.Mesh(ballGeo, mat);
+  ball.position.y = BALL_Y;
+
+  const post = new THREE.Mesh(postGeo, mat);
+  post.scale.y = BALL_Y - BALL_R;
+
+  holder.add(post, ball);
+  scene.add(holder);
+
+  const rad = heading * Math.PI / 180;
+  ball.userData = {
+    hit: false,
+    holder, post,
+    ox: x, oz: z,
+    dx: Math.cos(rad), dz: Math.sin(rad),
+    range, speed,
+    phase: i * 1.7,          // stagger them so they don't swing in unison
+  };
+  return ball;
+});
+
+/* J / K / L pick what the targets do. Sine patrol rather than a linear
+   ping-pong: it eases at the turnaround instead of snapping, which is what
+   makes tracking them feel like tracking. */
+const FLY_Y = 4.20, FLY_AMP = 2.00;
+let targetMode = 'static';
+
+function moveTargets(t) {
+  for (const b of targets) {
+    const d = b.userData;
+
+    if (targetMode === 'static') {
+      d.holder.position.set(d.ox, 0, d.oz);
+      b.position.y = BALL_Y;
+      d.post.visible = true;
+      continue;
+    }
+
+    const s = Math.sin(t * d.speed + d.phase);
+    d.holder.position.x = d.ox + d.dx * s * d.range;
+    d.holder.position.z = d.oz + d.dz * s * d.range;
+
+    if (targetMode === 'flying') {
+      /* Off its stand and bobbing on a slower, offset cycle, so vertical
+         and horizontal never line up into one predictable loop. */
+      b.position.y = FLY_Y + Math.sin(t * d.speed * 0.63 + d.phase * 1.7) * FLY_AMP;
+      d.post.visible = false;
+    } else {
+      b.position.y = BALL_Y;
+      d.post.visible = true;
+    }
+  }
+}
+
+function setTargetMode(m) {
+  targetMode = m;
+  for (const el of modeEls) el.classList.toggle('on', el.dataset.m === m);
+  /* Switching drill resets the board, so every mode starts from a clean
+     set rather than whatever survived the last one. */
+  for (const b of targets) {
+    b.userData.hit = false;
+    b.material.color.set(0xffffff);
+  }
+}
+
+/* Where the trail leaves from, in camera space. */
+const MUZZLE = new THREE.Vector3(0.26, -0.200, -2.40);
+const MUZZLE_NEAR = new THREE.Vector3(0.22, -0.200, -0.75);   // for point-blank shots
+
+/* ---------- tracers ----------
+   Purely cosmetic. The raycast below decides the hit instantly; this just
+   draws the line it took, so the feedback is visible without the shot
+   ever being simulated as a travelling projectile.
+
+   These are parented to the camera and drawn in camera space, which is
+   what pins the start of every trail to the muzzle — a world-space line
+   would slide backwards off the gun while you move. */
+const TRACER_COUNT = 16, TRACER_TRAVEL = 0.060, TRACER_FADE = 0.050, TRACER_RANGE = 70;
+const TRACER_UP = new THREE.Vector3(0, 1, 0);
+
+/* Open-ended cylinder shifted so its base sits at the origin — scaling Y
+   then stretches it forward from the muzzle instead of from its middle. */
+const tracerGeo = new THREE.CylinderGeometry(0.006, 0.006, 1, 6, 1, true);
+tracerGeo.translate(0, 0.5, 0);
+
+const tracers = [];
+for (let i = 0; i < TRACER_COUNT; i++) {
+  const mesh = new THREE.Mesh(tracerGeo, new THREE.MeshBasicMaterial({
+    color: 0xffb43c, transparent: true, opacity: 0, depthWrite: false, fog: false,
+  }));
+  mesh.visible = false;
+  camera.add(mesh);
+  tracers.push({
+    mesh,
+    origin: new THREE.Vector3(),
+    dir: new THREE.Vector3(),
+    total: 0, streak: 0, t: 0, fade: 0, active: false,
+  });
+}
+let tracerIdx = 0;
+
+const tmpDir = new THREE.Vector3();
+
+/* The streak travels the path instead of appearing all at once. It is
+   still only a drawing — the hit was already decided — so the travel time
+   is a fixed 0.10s at every range rather than a real muzzle velocity.
+   A constant speed would make close shots invisible and far ones look
+   like slow projectiles. */
+const TRACER_TRUE = 0xffffff;   // pinpoint shot
+const TRACER_OFF  = 0x3aa0ff;   // fired with spread — could have gone anywhere in the cone
+
+function spawnTracer(from, to, color) {
+  const tr = tracers[tracerIdx++ % TRACER_COUNT];
+  tmpDir.subVectors(to, from);
+  const len = tmpDir.length();
+  if (len < 0.01) return;
+
+  tr.origin.copy(from);
+  tr.dir.copy(tmpDir).divideScalar(len);
+  tr.total  = len;
+  tr.streak = Math.min(Math.max(len * 0.35, 2), 14);   // visible length of the streak
+  tr.t = 0;
+  tr.fade = 0;
+  tr.active = true;
+
+  tr.mesh.quaternion.setFromUnitVectors(TRACER_UP, tr.dir);
+  tr.mesh.material.color.set(color);
+  tr.mesh.material.opacity = 1;
+  tr.mesh.visible = true;
+}
+
+function updateTracers(dt) {
+  for (const tr of tracers) {
+    if (!tr.active) continue;
+
+    let head, tail, k;
+    if (tr.t < 1) {
+      tr.t = Math.min(1, tr.t + dt / TRACER_TRAVEL);
+      head = tr.total * tr.t;
+      tail = Math.max(0, head - tr.streak);
+      k = 1;
+    } else {
+      /* Arrived: the head holds at the impact and the tail runs in to
+         meet it, so the streak is swallowed by the target. */
+      tr.fade += dt;
+      const f = Math.min(tr.fade / TRACER_FADE, 1);
+      head = tr.total;
+      tail = Math.max(0, tr.total - tr.streak * (1 - f));
+      k = 1 - f;
+      if (f >= 1) { tr.active = false; tr.mesh.visible = false; continue; }
+    }
+
+    const seg = head - tail;
+    if (seg <= 0.001) { tr.mesh.visible = false; continue; }
+
+    tr.mesh.position.copy(tr.origin).addScaledVector(tr.dir, tail);
+
+    /* Thicken with distance. A fixed 6mm cylinder is well under a pixel
+       once it is 30m away, which is why far shots looked like nothing
+       happened. Scaling by the distance to the middle of the streak keeps
+       its width on screen roughly constant at every range. */
+    const mid = tail + seg * 0.5;
+    const dist = Math.hypot(
+      tr.origin.x + tr.dir.x * mid,
+      tr.origin.y + tr.dir.y * mid,
+      tr.origin.z + tr.dir.z * mid,
+    );
+    const thick = Math.min(Math.max(dist * 0.40, 1), 200);
+
+    tr.mesh.scale.set(thick, seg, thick);
+    tr.mesh.material.opacity = k;
+    tr.mesh.visible = true;
+  }
+}
+
+/* ---------- player state ---------- */
+const BOUND = 90;
+
+const keys = Object.create(null);
+let yaw = 0, pitch = 0, locked = false;
+let vx = 0, vz = 0, vy = 0;
+let grounded = true, eyeHeight = T.eye;
+let jumpEdge = false;                      // true only on the frame Space goes down
+let jumpsLeft = T.airJumps;                // mid-air jumps remaining
+let airLift = false;                       // rising out of an air jump
+let crouching = false;
+let airCap = T.maxSpeed;                   // horizontal ceiling while airborne
+
+const pos = new THREE.Vector3(0, 0, 12);   // feet; camera sits at pos.y + eyeHeight
+
+const ray = new THREE.Raycaster();
+const CENTER = new THREE.Vector2(0, 0);
+
+/* ============================================================
+   MOVEMENT
+   ============================================================ */
+
+/* Bleeds speed toward zero. stopSpeed floors the control value so slow
+   movement still decays fast enough to come to a clean stop. */
+function applyFriction(dt) {
+  const speed = Math.hypot(vx, vz);
+  if (speed < 1e-4) { vx = 0; vz = 0; return; }
+  const control = speed < T.stopSpeed ? T.stopSpeed : speed;
+  const drop = control * T.friction * dt;
+  const scale = Math.max(speed - drop, 0) / speed;
+  vx *= scale; vz *= scale;
+}
+
+/* Only the component of velocity ALONG wishDir counts toward the speed
+   limit. That is what makes counter-strafing work: hold the opposite key
+   and currentspeed goes negative, addspeed goes large, and you get full
+   acceleration into the stop. */
+function accelerate(wx, wz, wishSpeed, accel, dt) {
+  const current = vx * wx + vz * wz;
+  const addSpeed = wishSpeed - current;
+  if (addSpeed <= 0) return;
+  let accelSpeed = accel * wishSpeed * dt;
+  if (accelSpeed > addSpeed) accelSpeed = addSpeed;
+  vx += accelSpeed * wx;
+  vz += accelSpeed * wz;
+}
+
+function wishSpeedNow() {
+  return crouching ? T.maxSpeed * T.crouchMul : T.maxSpeed;
+}
+
+function move(dt) {
+  const fwd  = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
+  const side = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+
+  let wx = 0, wz = 0;
+  if (fwd || side) {
+    const sy = Math.sin(yaw), cy = Math.cos(yaw);
+    wx = -sy * fwd + cy * side;
+    wz = -cy * fwd - sy * side;
+    const len = Math.hypot(wx, wz);
+    wx /= len; wz /= len;
+  }
+  const wishSpeed = (fwd || side) ? wishSpeedNow() : 0;
+
+  if (grounded) {
+
+    applyFriction(dt);
+    if (wishSpeed > 0) accelerate(wx, wz, wishSpeed, T.accel, dt);
+
+    /* Edge-triggered: holding Space does not auto-hop. */
+    if (jumpEdge) {
+      vy = T.jumpVel;
+      grounded = false;
+      jumpsLeft = T.airJumps;
+      airCap = Math.max(T.maxSpeed, Math.hypot(vx, vz));
+    }
+  } else {
+    /* Mid-air jump. Velocity is SET, not added, so a second jump on the way
+       down cancels the fall instead of doing almost nothing.
+       It fires on a fresh press, or automatically once you start falling
+       with Space still held — otherwise holding for the glide would eat
+       the double jump, since the key never goes up to re-trigger. */
+    if (jumpsLeft > 0 && (jumpEdge || (keys.Space && vy < 0))) {
+      vy = T.airJumpVel;
+      jumpsLeft--;
+      airLift = true;
+    }
+
+    if (wishSpeed > 0) accelerate(wx, wz, wishSpeed, T.airAccel, dt);
+
+    /* Anything above run speed bleeds off with the same friction curve the
+       ground uses. Run speed itself is never touched, so this still isn't
+       ground friction — no air braking. */
+    const hs = Math.hypot(vx, vz);
+    if (hs > T.maxSpeed) {
+      const excess = hs - T.maxSpeed;
+      const control = Math.max(excess, T.stopSpeed);
+      const left = Math.max(0, excess - control * T.friction * dt);
+      const target = Math.min(T.maxSpeed + left, airCap);
+      vx *= target / hs; vz *= target / hs;
+    }
+
+    /* Glide: holding Space on the way down cuts gravity and caps the fall.
+       Only while descending, so it never stretches the rise of a jump.
+       Rising out of an air jump pulls extra gravity instead, which makes
+       the lift snap up quickly rather than drifting to its peak. */
+    const gliding = keys.Space && vy < 0;
+    if (vy <= 0) airLift = false;
+    let g = T.gravity;
+    if (gliding) g *= T.glideGrav;
+    else if (airLift) g *= T.airJumpGrav;
+
+    vy -= g * dt;
+    if (gliding && vy < -T.glideFall) vy = -T.glideFall;
+  }
+  jumpEdge = false;
+
+  pos.x += vx * dt;
+  pos.z += vz * dt;
+  pos.y += vy * dt;
+
+  if (pos.y <= 0) {
+    pos.y = 0; vy = 0; grounded = true; jumpsLeft = T.airJumps; airLift = false;
+    airCap = T.maxSpeed;
+  }
+
+  pos.x = Math.max(-BOUND, Math.min(BOUND, pos.x));
+  pos.z = Math.max(-BOUND, Math.min(BOUND, pos.z));
+
+  const targetEye = crouching ? T.crouchEye : T.eye;
+  eyeHeight += (targetEye - eyeHeight) * Math.min(1, 14 * dt);
+}
+
+/* ---------- pointer lock ---------- */
+let freshLock = false, rawInput = false;
+
+wrap.addEventListener('click', async () => {
+  if (locked) return;
+  try {
+    /* Chrome returns a promise here and rejects if it cannot give raw
+       input. Safari still uses the old void signature and silently drops
+       the option — so a non-promise return means OS acceleration is in
+       play, and the readout says which one you actually got. */
+    const p = wrap.requestPointerLock({ unadjustedMovement: true });
+    if (p && typeof p.then === 'function') { await p; rawInput = true; }
+    else { rawInput = false; }
+  } catch (e) {
+    rawInput = false;
+    try { await wrap.requestPointerLock(); } catch (e2) {}
+  }
+  inputEl.textContent = rawInput ? 'raw' : 'os accel';
+});
+
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === wrap;
+  if (locked) freshLock = true;
+  else for (const k in keys) keys[k] = false;
+});
+
+/* Only an obvious driver spike gets discarded. This used to sit at 400,
+   which a genuine fast flick on a high-DPI mouse can exceed in a single
+   coalesced event — those flicks were being thrown away, which is exactly
+   what makes aim feel muted instead of snappy. */
+const MAX_DELTA = 1200;
+document.addEventListener('mousemove', (e) => {
+  if (!locked) return;
+  if (freshLock) { freshLock = false; return; }
+  const dx = e.movementX, dy = e.movementY;
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return;
+  if (Math.abs(dx) > MAX_DELTA || Math.abs(dy) > MAX_DELTA) return;
+
+  const rad = COUNT_SCALE * radPerCount();
+  yaw   -= dx * rad;
+  pitch -= dy * rad;
+  pitch = Math.max(-Math.PI / 2 + 0.02, Math.min(Math.PI / 2 - 0.02, pitch));
+});
+
+/* ---------- input ---------- */
+addEventListener('keydown', (e) => {
+  /* A tap on - or + steps once; the loop takes over if the key is held. */
+  if (!e.repeat) {
+    if (e.code === 'Minus' || e.code === 'NumpadSubtract') { setSens(valSens - SENS_STEP); sensHold = 0; sensAccum = 0; }
+    if (e.code === 'Equal' || e.code === 'NumpadAdd')      { setSens(valSens + SENS_STEP); sensHold = 0; sensAccum = 0; }
+  }
+
+  if (e.repeat) { keys[e.code] = true; return; }
+  if (e.code === 'Space') { e.preventDefault(); if (locked) jumpEdge = true; }
+  if (e.code === 'ControlLeft' || e.code === 'KeyC') { e.preventDefault(); crouching = true; }
+  if (e.code === 'KeyJ') setTargetMode('static');
+  if (e.code === 'KeyK') setTargetMode('moving');
+  if (e.code === 'KeyL') setTargetMode('flying');
+  if (e.code === 'KeyR') {
+    targets.forEach((b) => { b.userData.hit = false; b.material.color.set(0xffffff); });
+  }
+  keys[e.code] = true;
+});
+
+addEventListener('keyup', (e) => {
+  if (e.code === 'ControlLeft' || e.code === 'KeyC') crouching = false;
+  keys[e.code] = false;
+});
+addEventListener('blur', () => { for (const k in keys) keys[k] = false; crouching = false; });
+
+/* ---------- accuracy ----------
+   Accuracy returns below a speed threshold rather than at a dead stop.
+   That gap is what makes deadzoning possible: counter-strafe, and you are
+   already accurate while still drifting, instead of having to reach zero.
+   Being airborne carries no penalty at all — jump shots are
+   pinpoint regardless of how fast you are travelling. */
+const DEADZONE   = 0.40;                   // fraction of run speed that is still pinpoint
+const SPREAD_RUN = 4.5 * Math.PI / 180;    // at full run speed
+
+function spreadNow() {
+  if (!grounded) return 0;
+  const r = Math.min(Math.hypot(vx, vz) / T.maxSpeed, 1.5);
+  return r <= DEADZONE ? 0 : ((r - DEADZONE) / (1 - DEADZONE)) * SPREAD_RUN;
+}
+
+const shotEnd = new THREE.Vector3();
+const camRight = new THREE.Vector3();
+const camUp = new THREE.Vector3();
+
+wrap.addEventListener('mousedown', (e) => {
+  if (!locked || e.button !== 0) return;
+
+  ray.setFromCamera(CENTER, camera);
+
+  /* Push the ray off-centre by a random amount inside the cone. sqrt on the
+     radius keeps the scatter even across the disc — without it shots would
+     bunch toward the middle and the spread would feel weaker than it is. */
+  const spread = spreadNow();
+  if (spread > 0.0001) {
+    const ang = Math.random() * Math.PI * 2;
+    const rad = Math.sqrt(Math.random()) * spread;
+    const t = Math.tan(rad);
+    camRight.set(1, 0, 0).applyQuaternion(camera.quaternion);
+    camUp.set(0, 1, 0).applyQuaternion(camera.quaternion);
+    ray.ray.direction
+      .addScaledVector(camRight, Math.cos(ang) * t)
+      .addScaledVector(camUp, Math.sin(ang) * t)
+      .normalize();
+  }
+
+  const hits = ray.intersectObjects(targets, false);
+  const floor = ray.intersectObject(ground, false);
+
+  /* Whichever comes first: a target, the floor, or nothing. Checking the
+     floor matters twice over — a miss that hits the ground gets a real
+     endpoint you can see, and you can no longer shoot through the floor
+     to tag something on the far side. */
+  const ballDist  = hits.length ? hits[0].distance : Infinity;
+  const floorDist = floor.length ? floor[0].distance : Infinity;
+
+  if (ballDist <= floorDist && hits.length) {
+    shotEnd.copy(hits[0].point);
+    const ball = hits[0].object;
+    if (!ball.userData.hit) {
+      ball.userData.hit = true;
+      ball.material.color.set(0xff4a35);
+    }
+  } else if (floor.length) {
+    shotEnd.copy(floor[0].point);
+  } else {
+    shotEnd.copy(camera.position).addScaledVector(ray.ray.direction, TRACER_RANGE);
+  }
+
+  /* Into camera space, where the muzzle is a fixed point. */
+  camera.worldToLocal(shotEnd);
+
+  /* Close targets sit nearer than the muzzle, which used to mean no trail
+     at all — shoot something in your face and nothing drew. Fall back to a
+     start point right at the gun so there is always something to see. */
+  const from = shotEnd.z < MUZZLE.z ? MUZZLE : MUZZLE_NEAR;
+  if (shotEnd.z < from.z) {
+    const tint = spread > 0.0001 ? TRACER_OFF : TRACER_TRUE;
+    spawnTracer(from, shotEnd, tint);
+  }
+});
+
+/* ---------- loop ---------- */
+function resize() {
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / Math.max(h, 1);
+  camera.updateProjectionMatrix();
+}
+addEventListener('resize', resize);
+resize();
+
+const clock = new THREE.Clock();
+
+renderer.setAnimationLoop(() => {
+  /* Fixed 128 Hz sub-steps: friction and acceleration applied once per
+     variable frame would feel different at 60 Hz than at 144 Hz. */
+  const frame = Math.min(clock.getDelta(), 0.1);
+
+  /* Targets keep patrolling whether or not the cursor is locked. */
+  moveTargets(clock.elapsedTime);
+  updateTracers(frame);
+
+  /* Held - / + : after a short delay the rate ramps, so a long hold sweeps
+     the whole range while a tap still moves it one clean step. */
+  const sensDir = ((keys.Equal || keys.NumpadAdd) ? 1 : 0)
+                - ((keys.Minus || keys.NumpadSubtract) ? 1 : 0);
+  if (sensDir) {
+    sensHold += frame;
+    if (sensHold > SENS_HOLD_DELAY) {
+      const t = sensHold - SENS_HOLD_DELAY;
+      const rate = Math.min(SENS_RATE * (1 + SENS_RAMP * t), SENS_RATE_MAX);
+      sensAccum += rate * frame;
+      while (sensAccum >= 1) { setSens(valSens + sensDir * SENS_STEP); sensAccum -= 1; }
+    }
+  } else {
+    sensHold = 0; sensAccum = 0;
+  }
+  sensRow.classList.toggle('adjusting', sensDir !== 0);
+
+  if (locked) {
+    const STEP = 1 / 128;
+    let remaining = frame;
+    while (remaining > 0) {
+      const dt = Math.min(STEP, remaining);
+      move(dt);
+      remaining -= dt;
+    }
+  }
+
+  camera.position.set(pos.x, pos.y + eyeHeight, pos.z);
+  camera.rotation.set(pitch, yaw, 0);
+
+  renderer.render(scene, camera);
+});
+
+/* ---------- carry state across republishes ---------- */
+try {
+  window.claude?.hot?.snapshot?.(() => ({
+    hit: targets.map((b) => b.userData.hit),
+    pos: pos.toArray(), yaw, pitch,
+  }));
+  const restore = (d) => {
+    if (!d || typeof d !== 'object') return;
+    if (Array.isArray(d.hit)) d.hit.forEach((was, i) => {
+      if (was && targets[i]) { targets[i].userData.hit = true; targets[i].material.color.set(0xff4a35); }
+    });
+    if (Array.isArray(d.pos)) pos.set(d.pos[0], 0, d.pos[2]);
+    if (typeof d.yaw === 'number') yaw = d.yaw;
+    if (typeof d.pitch === 'number') pitch = d.pitch;
+  };
+  if (window.claude?.hot?.ready) window.claude.hot.ready(restore);
+  else restore(window.claude?.hot?.data);
+} catch (e) { /* outside the artifact host */ }
+</script>
+</body>
+</html>
