@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>aim trainer</title>
+<title>FPS v1</title>
 <style>
   html,body{height:100%;}
   body{margin:0;background:#0d0f12;color:#eceef2;overflow:hidden;}
@@ -893,6 +893,11 @@ wrap.addEventListener('mousedown', (e) => {
   const ballDist  = hits.length ? hits[0].distance : Infinity;
   const floorDist = floor.length ? floor[0].distance : Infinity;
 
+  /* The run is over once the last target falls, so shots after that are
+     just messing about and are not scored either way — otherwise the
+     finished accuracy figure would keep drifting while you stand there. */
+  const scoring = runEnd === null;
+
   if (ballDist <= floorDist && hits.length) {
     shotEnd.copy(hits[0].point);
     const ball = hits[0].object;
@@ -906,9 +911,9 @@ wrap.addEventListener('mousedown', (e) => {
         recordRun(runEnd - runStart);
       }
     }
-    hitCount++;
+    if (scoring) hitCount++;
   } else {
-    missCount++;
+    if (scoring) missCount++;
     if (floor.length) shotEnd.copy(floor[0].point);
     else shotEnd.copy(camera.position).addScaledVector(ray.ray.direction, TRACER_RANGE);
   }
